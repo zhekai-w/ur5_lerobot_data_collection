@@ -11,7 +11,7 @@ sudo apt-get install ros-humble-ur
 
 ## Network Setup
 
-Set your PC's IP address to `192.168.1.199`.
+I set my PC's IP address to `192.168.1.199`. Your robot ip setup may vary.
 
 For detailed UR robot network setup and configuration, follow the official documentation:
 https://docs.ros.org/en/ros2_packages/humble/api/ur_robot_driver/doc/installation/toc.html
