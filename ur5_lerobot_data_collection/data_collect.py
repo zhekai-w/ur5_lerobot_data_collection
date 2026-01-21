@@ -1,14 +1,13 @@
 import numpy as np
 from pynput import keyboard
 import threading
-# ROS2 and UR Library
+# ROS2 Library
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 
 # LeRobot Library
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
 
 class DataCollector(Node):
 
@@ -19,19 +18,19 @@ class DataCollector(Node):
         self.frame_count = 0
         self.previous_position = None
         self.lock = threading.Lock()
-        
+
         self.subscription = self.create_subscription(
-            JointState, 
-            "/joint_states", 
-            self.jointstate_callback, 
+            JointState,
+            "/joint_states",
+            self.jointstate_callback,
             1)
-        
+
         # Start keyboard listener
         self.listener = keyboard.Listener(on_press=self.on_press)
         self.listener.start()
-        
+
         print("Press 's' to start recording, 'e' to end episode, 'q' to quit")
-    
+
     def on_press(self, key):
         try:
             if key.char == 's':
@@ -62,7 +61,7 @@ class DataCollector(Node):
             pass
 
     # TODO: change joints order from [shoulder_lift, elbow, wrist_1, wrist_2, wrist_3, shoulder_pen]
-    # to [shoulder_pen, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3] 
+    # to [shoulder_pen, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]
     def jointstate_callback(self, msg):
         with self.lock:
             if not self.is_recording:
@@ -70,21 +69,21 @@ class DataCollector(Node):
 
             # Get current position with gripper (0 for closed)
             current_position = np.array(list(msg.position) + [0], dtype=np.float32)
-            
+
             # Only record if we have a previous position (for action)
             if self.previous_position is not None:
                 # TODO: Replace with actual camera capture
                 image = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-                
+
                 frame = {
                     "observation.state": self.previous_position,
                     "observation.images.cam1": image,
                     "action": current_position,  # Current position is the action
                 }
-                
+
                 self.dataset.add_frame(frame, task="reach target")
                 self.frame_count += 1
-            
+
             # Update previous position for next frame
             self.previous_position = current_position
 
@@ -94,6 +93,7 @@ def main():
     n_joints = 7
     # joints_name = ["shoulder_pan", "shoulder_lift", "elbow", "wrist_1", "wrist_2", "wrist_3", "gripper"]
     joints_name = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"]
+    n_joints = len(joints_name)
 
     # Camera configuration
     width = 640
@@ -107,17 +107,17 @@ def main():
     features = {
         "observation.state": {
             "dtype": "float32",
-            "shape": (n_joints,), 
+            "shape": (n_joints,),
             "names": list(joints_name),
         },
         "observation.images.cam1": {
-            "dtype": cam_dtype, 
+            "dtype": cam_dtype,
             "shape": (height, width, channel),
             "names": ["height", "width", "channel"],
         },
         "action": {
             "dtype": "float32",
-            "shape": (n_joints,), 
+            "shape": (n_joints,),
             "names": list(joints_name),
         },
     }
@@ -134,7 +134,7 @@ def main():
 
     rclpy.init()
     data_collector = DataCollector(dataset)
-    
+
     try:
         rclpy.spin(data_collector)
     except KeyboardInterrupt:
