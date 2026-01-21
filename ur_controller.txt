@@ -1,0 +1,15 @@
+# Prerequisiton 
+sudo apt-get install ros-humble-ur
+# set your pc ip to 192.168.1.199
+
+# launch controller for real robot
+ros2 launch ur_robot_driver ur_control.launch.py ur_type:=ur5 robot_ip:=192.168.1.100
+
+# launch moveit controller 
+ros2 launch ur_moveit_config ur_moveit.launch.py ur_type:=ur5
+
+# Set domain ID
+echo "export ROS_DOMAIN_ID=69" >> ~/.bashrc
+
+# use fake hardware
+ros2 launch ur_robot_driver ur_control.launch.py ur_type:=ur5e robot_ip:=yyy.yyy.yyy.yyy use_fake_hardware:=true launch_rviz:=true
