@@ -1,3 +1,4 @@
+import time
 import numpy as np
 from pynput import keyboard
 import threading
@@ -9,6 +10,11 @@ from sensor_msgs.msg import JointState
 # LeRobot Library
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+# Azure Kinect
+import pyk4a
+from pyk4a import Config, PyK4A
+
+
 class DataCollector(Node):
 
     def __init__(self, dataset):
@@ -19,17 +25,75 @@ class DataCollector(Node):
         self.previous_position = None
         self.lock = threading.Lock()
 
+        # Recording fps
+        self.target_fps = 30
+
+        # Buffer for latest joint state
+        self.latest_joint_position = None
+        self.joint_lock = threading.Lock()
+
+        # Subscribe to joint states (just for buffering)
         self.subscription = self.create_subscription(
             JointState,
             "/joint_states",
             self.jointstate_callback,
             1)
 
+        # Timer for recording at exactly 30fps
+        timer_period = 1.0 / self.target_fps
+        self.recording_timer = self.create_timer(timer_period, self.recording_callback)
+
+        # Initialize Azure Kinect
+        config = Config()
+        config.color_resolution = pyk4a.ColorResolution.RES_1080P
+        config.depth_mode = pyk4a.DepthMode.NFOV_UNBINNED
+        config.camera_fps = pyk4a.FPS.FPS_30
+        config.synchronized_images_only = True
+
+        self.k4a = PyK4A(config)
+        self.k4a.start()
+
+        # Async camera capture variables
+        self.latest_image = None
+        self.image_lock = threading.Lock()
+        self.camera_running = True
+        self.camera_thread = threading.Thread(target=self._camera_capture_loop, daemon=True)
+        self.camera_thread.start()
+
         # Start keyboard listener
         self.listener = keyboard.Listener(on_press=self.on_press)
         self.listener.start()
 
         print("Press 's' to start recording, 'e' to end episode, 'q' to quit")
+
+    def _camera_capture_loop(self):
+        """Continuously capture images from Azure Kinect in a separate thread"""
+        while self.camera_running:
+            try:
+                capture = self.k4a.get_capture()
+                if capture.color is not None:
+                    # Get BGR image (1920x1080x3)
+                    bgr = capture.color[:, :, :3]
+                    color_image = np.array(bgr, dtype=np.uint8)
+                    with self.image_lock:
+                        self.latest_image = color_image
+            except Exception as e:
+                self.get_logger().error(f"Camera capture error: {e}")
+                time.sleep(0.01)  # Brief sleep on error to avoid tight loop
+
+    def get_latest_image(self):
+        """Get the most recent captured image"""
+        with self.image_lock:
+            if self.latest_image is not None:
+                return self.latest_image.copy()
+        return None
+
+    def get_latest_joint_position(self):
+        """Get the most recent joint position"""
+        with self.joint_lock:
+            if self.latest_joint_position is not None:
+                return self.latest_joint_position.copy()
+        return None
 
     def on_press(self, key):
         try:
@@ -40,40 +104,61 @@ class DataCollector(Node):
                     self.previous_position = None
                     print("\nStarted recording")
             elif key.char == 'e':
+                # Check and update state inside lock, but save outside to avoid blocking
+                should_save = False
+                frame_count_to_report = 0
                 with self.lock:
                     if self.is_recording and self.frame_count > 0:
                         self.is_recording = False
-                        try:
-                            self.dataset.save_episode()
-                            print(f"Episode saved ({self.frame_count} frames)")
-                            print(f"Total episodes: {self.dataset.num_episodes}")
-                        except Exception as e:
-                            print(f"Error saving episode: {e}")
-                        finally:
-                            self.previous_position = None
-                            self.frame_count = 0
+                        should_save = True
+                        frame_count_to_report = self.frame_count
+                        self.previous_position = None
+                        self.frame_count = 0
                     else:
                         print("No frames recorded yet")
+
+                # Save episode outside the lock to avoid blocking callbacks
+                if should_save:
+                    try:
+                        print("Saving episode...")
+                        self.dataset.save_episode()
+                        print(f"Episode saved ({frame_count_to_report} frames)")
+                        print(f"Total episodes: {self.dataset.num_episodes}")
+                    except Exception as e:
+                        print(f"Error saving episode: {e}")
             elif key.char == 'q':
                 print("Quitting...")
-                rclpy.shutdown()
+                raise SystemExit()
         except AttributeError:
             pass
 
-    # TODO: change joints order from [shoulder_lift, elbow, wrist_1, wrist_2, wrist_3, shoulder_pen]
-    # to [shoulder_pen, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]
     def jointstate_callback(self, msg):
+        """Just buffer the latest joint state - no recording logic here"""
+        # Get current position with gripper (0 for closed)
+        current_position = np.array(list(msg.position) + [0], dtype=np.float32)
+        with self.joint_lock:
+            self.latest_joint_position = current_position
+
+    def recording_callback(self):
+        """Timer callback at exactly 30fps for recording frames"""
         with self.lock:
             if not self.is_recording:
                 return
 
-            # Get current position with gripper (0 for closed)
-            current_position = np.array(list(msg.position) + [0], dtype=np.float32)
+            # Get latest joint position
+            current_position = self.get_latest_joint_position()
+            if current_position is None:
+                self.get_logger().warn("No joint state available yet, skipping frame")
+                return
 
             # Only record if we have a previous position (for action)
             if self.previous_position is not None:
-                # TODO: Replace with actual camera capture
-                image = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+                # Get the latest cached image from async capture thread
+                image = self.get_latest_image()
+
+                if image is None:
+                    self.get_logger().warn("No image available yet, skipping frame")
+                    return
 
                 frame = {
                     "observation.state": self.previous_position,
@@ -87,6 +172,17 @@ class DataCollector(Node):
             # Update previous position for next frame
             self.previous_position = current_position
 
+    def stop_camera(self):
+        """Stop the camera capture thread and Azure Kinect"""
+        self.camera_running = False
+        if self.camera_thread.is_alive():
+            self.camera_thread.join(timeout=1.0)
+        try:
+            self.k4a.stop()
+            self.get_logger().info("Azure Kinect camera stopped")
+        except Exception as e:
+            print(f"Error stopping camera: {e}")
+
 
 def main():
     # Robot configuration
@@ -95,9 +191,9 @@ def main():
     joints_name = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"]
     n_joints = len(joints_name)
 
-    # Camera configuration
-    width = 640
-    height = 480
+    # Camera configuration (Azure Kinect 1080p)
+    width = 1920
+    height = 1080
     channel = 3
     cam_dtype = "video"
     root_dir = "./dataset"
@@ -129,6 +225,8 @@ def main():
         root=root_dir,
         robot_type="ur5",
         use_videos=True,
+        image_writer_processes=0,
+        image_writer_threads=4,  # Async image writing for better fps
         batch_encoding_size=1,
     )
 
@@ -137,9 +235,20 @@ def main():
 
     try:
         rclpy.spin(data_collector)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         pass
     finally:
+        data_collector.stop_camera()
+        # Stop the async image writer before shutting down
+        dataset.stop_image_writer()
+
+        # Encode any remaining episodes that haven't been encoded yet
+        if dataset.episodes_since_last_encoding > 0:
+            print(f"Encoding {dataset.episodes_since_last_encoding} remaining episode(s) to video...")
+            start_ep = dataset.num_episodes - dataset.episodes_since_last_encoding
+            dataset.batch_encode_videos(start_ep, dataset.num_episodes)
+            print("Video encoding complete.")
+
         data_collector.destroy_node()
         rclpy.shutdown()
 
