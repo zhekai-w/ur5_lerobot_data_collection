@@ -14,6 +14,9 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 import pyk4a
 from pyk4a import Config, PyK4A
 
+# Realsense
+import pyrealsense2 as rs
+
 
 class DataCollector(Node):
 
@@ -53,12 +56,27 @@ class DataCollector(Node):
         self.k4a = PyK4A(config)
         self.k4a.start()
 
+        # Initialize Realsense
+        self.pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_stream(rs.stream.color, 1920, 1080, rs.format.rgb8, 30)
+        self.pipeline.start(config)
+
+
         # Async camera capture variables
-        self.latest_image = None
-        self.image_lock = threading.Lock()
+        # Azure
+        self.latest_k4a_image = None
+        self.k4a_image_lock = threading.Lock()
+        # Realsense
+        self.lastest_rs_image = None
+        self.rs_image_lock = threading.Lock()
+
         self.camera_running = True
-        self.camera_thread = threading.Thread(target=self._camera_capture_loop, daemon=True)
-        self.camera_thread.start()
+
+        self.rs_thread = threading.Thread(target=self._rs_capture_loop, daemon=True)
+        self.k4a_thread = threading.Thread(target=self._k4a_capture_loop, daemon=True)
+        self.rs_thread.start()
+        self.k4a_thread.start()
 
         # Start keyboard listener
         self.listener = keyboard.Listener(on_press=self.on_press)
@@ -66,26 +84,49 @@ class DataCollector(Node):
 
         print("Press 's' to start recording, 'e' to end episode, 'q' to quit")
 
-    def _camera_capture_loop(self):
+    def _k4a_capture_loop(self):
         """Continuously capture images from Azure Kinect in a separate thread"""
         while self.camera_running:
             try:
                 capture = self.k4a.get_capture()
                 if capture.color is not None:
                     # Get BGR image (1920x1080x3)
-                    bgr = capture.color[:, :, :3]
-                    color_image = np.array(bgr, dtype=np.uint8)
-                    with self.image_lock:
-                        self.latest_image = color_image
+                    # bgr = capture.color[:, :, :3]
+                    rgb = capture.color[:, :, 2::-1]
+                    color_image = np.array(rgb, dtype=np.uint8)
+                    with self.k4a_image_lock:
+                        self.latest_k4a_image = color_image
             except Exception as e:
-                self.get_logger().error(f"Camera capture error: {e}")
+                self.get_logger().error(f"Azure Kinect capture error: {e}")
                 time.sleep(0.01)  # Brief sleep on error to avoid tight loop
 
-    def get_latest_image(self):
+    def _rs_capture_loop(self):
+        """Continuously capture images from Azure Kinect in a separate thread"""
+        while self.camera_running:
+            try:
+                frames = self.pipeline.wait_for_frames()
+                color_frame = frames.get_color_frame()
+                if color_frame:
+                    # pyrealsense2 already delivers rgb8 as requested in config
+                    color_image = np.asanyarray(color_frame.get_data(), dtype=np.uint8)
+                    with self.rs_image_lock:
+                        self.latest_rs_image = color_image
+            except RuntimeError as e:
+                self.get_logger().error(f"Realsense capture error: {e}")
+                time.sleep(0.01)  # Brief sleep on error to avoid tight loop
+
+    def get_latest_k4a_image(self):
         """Get the most recent captured image"""
-        with self.image_lock:
-            if self.latest_image is not None:
-                return self.latest_image.copy()
+        with self.k4a_image_lock:
+            if self.latest_k4a_image is not None:
+                return self.latest_k4a_image.copy()
+        return None
+
+    def get_latest_rs_image(self):
+        """Get the most recent captured image"""
+        with self.rs_image_lock:
+            if self.latest_rs_image is not None:
+                return self.latest_rs_image.copy()
         return None
 
     def get_latest_joint_position(self):
@@ -154,15 +195,20 @@ class DataCollector(Node):
             # Only record if we have a previous position (for action)
             if self.previous_position is not None:
                 # Get the latest cached image from async capture thread
-                image = self.get_latest_image()
+                k4a_image = self.get_latest_k4a_image()
+                rs_image = self.get_latest_rs_image()
 
-                if image is None:
-                    self.get_logger().warn("No image available yet, skipping frame")
+                if k4a_image is None:
+                    self.get_logger().warn("No Azure Kinect image available yet, skipping frame")
+                    return
+                if rs_image is None:
+                    self.get_logger().warn("No RealSense image available, skipping frame")
                     return
 
                 frame = {
                     "observation.state": self.previous_position,
-                    "observation.images.cam1": image,
+                    "observation.images.cam1": k4a_image,
+                    "observation.images.cam2": rs_image,
                     "action": current_position,  # Current position is the action
                 }
 
@@ -175,20 +221,26 @@ class DataCollector(Node):
     def stop_camera(self):
         """Stop the camera capture thread and Azure Kinect"""
         self.camera_running = False
-        if self.camera_thread.is_alive():
-            self.camera_thread.join(timeout=1.0)
+        for thread in (self.k4a_thread, self.rs_thread):
+            if thread.is_alive():
+                thread.join(timeout=1.0)
         try:
             self.k4a.stop()
-            self.get_logger().info("Azure Kinect camera stopped")
+            self.get_logger().info("Azure Kinect stopped")
         except Exception as e:
-            print(f"Error stopping camera: {e}")
+            print(f"Error stopping Azure Kinect: {e}")
+        try:
+            self.pipeline.stop()
+            self.get_logger().info("Realsense pipeline stopped")
+        except Exception as e:
+            print(f"Error stopping Realsense: {e}")
 
 
 def main():
     # Robot configuration
-    n_joints = 7
-    # joints_name = ["shoulder_pan", "shoulder_lift", "elbow", "wrist_1", "wrist_2", "wrist_3", "gripper"]
-    joints_name = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"]
+    joints_name = ["shoulder_lift_joint", "elbow_joint", "wrist_1_joint", "wrist_2_joint",
+        "wrist_3_joint", "shoulder_pan_joint", "gripper_joint"]
+    # joints_name = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"]
     n_joints = len(joints_name)
 
     # Camera configuration (Azure Kinect 1080p)
@@ -211,6 +263,11 @@ def main():
             "shape": (height, width, channel),
             "names": ["height", "width", "channel"],
         },
+        "observation.images.cam2": {
+            "dtype": cam_dtype,
+            "shape": (height, width, channel),
+            "names": ["height", "width", "channel"],
+        },
         "action": {
             "dtype": "float32",
             "shape": (n_joints,),
@@ -220,14 +277,15 @@ def main():
 
     dataset = LeRobotDataset.create(
         repo_id="zhekai-w/ur5_lerobot_dataset",
-        fps=30,
+        fps=20,
         features=features,
         root=root_dir,
         robot_type="ur5",
         use_videos=True,
-        image_writer_processes=0,
-        image_writer_threads=4,  # Async image writing for better fps
-        batch_encoding_size=1,
+        video_backend="pyav",
+        image_writer_processes=20,
+        image_writer_threads=20,  # Async image writing for better fps
+        # batch_encoding_size=20,
     )
 
     rclpy.init()

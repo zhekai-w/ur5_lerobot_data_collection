@@ -1,198 +1,280 @@
+#!/usr/bin/env python3
+
+import sys
 import time
-import numpy as np
-from pynput import keyboard
 import threading
-# ROS2 Library
+
+import numpy as np
+
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
 from sensor_msgs.msg import JointState
 
-# LeRobot Library
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 # Azure Kinect
 import pyk4a
 from pyk4a import Config, PyK4A
 
-class DataCollector(Node):
+# Realsense
+import pyrealsense2 as rs
 
-    def __init__(self, dataset):
-        super().__init__('joint_state_subscriber')
-        self.dataset = dataset
-        self.is_recording = False
-        self.frame_count = 0
-        self.previous_position = None
-        self.lock = threading.Lock()
 
-        # Rate limiting for 30 fps recording
-        self.target_fps = 30
-        self.frame_interval = 1.0 / self.target_fps
-        self.last_record_time = 0.0
+class JointStateTap(Node):
+    """Minimal ROS2 node that buffers the latest joint state."""
+    def __init__(self):
+        super().__init__('joint_state_tap')
+        self._lock = threading.Lock()
+        self._latest = None
+        self.create_subscription(JointState, "/joint_states", self._cb, 1)
+        self.get_logger().info("[JointStateTap] Listening on /joint_states")
 
-        self.subscription = self.create_subscription(
-            JointState,
-            "/joint_states",
-            self.jointstate_callback,
-            1)
+    def _cb(self, msg):
+        pos = np.array(list(msg.position) + [0], dtype=np.float32)
+        with self._lock:
+            self._latest = pos
 
-        # Initialize Azure Kinect
-        config = Config()
-        config.color_resolution = pyk4a.ColorResolution.RES_1080P
-        config.depth_mode = pyk4a.DepthMode.NFOV_UNBINNED
-        config.camera_fps = pyk4a.FPS.FPS_30
-        config.synchronized_images_only = True
-
-        self.k4a = PyK4A(config)
-        self.k4a.start()
-
-        # Start keyboard listener
-        self.listener = keyboard.Listener(on_press=self.on_press)
-        self.listener.start()
-
-        print("Press 's' to start recording, 'e' to end episode, 'q' to quit")
-
-    def on_press(self, key):
-        try:
-            if key.char == 's':
-                with self.lock:
-                    self.is_recording = True
-                    self.frame_count = 0
-                    self.previous_position = None
-                    self.last_record_time = 0.0
-                    print("\nStarted recording")
-            elif key.char == 'e':
-                with self.lock:
-                    if self.is_recording and self.frame_count > 0:
-                        self.is_recording = False
-                        try:
-                            self.dataset.save_episode()
-                            print(f"Episode saved ({self.frame_count} frames)")
-                            print(f"Total episodes: {self.dataset.num_episodes}")
-                        except Exception as e:
-                            print(f"Error saving episode: {e}")
-                        finally:
-                            self.previous_position = None
-                            self.frame_count = 0
-                    else:
-                        print("No frames recorded yet")
-            elif key.char == 'q':
-                print("Quitting...")
-                rclpy.shutdown()
-        except AttributeError:
-            pass
-
-    def capture_azure_image(self):
-        """Capture image from Azure Kinect camera"""
-        try:
-            capture = self.k4a.get_capture()
-            if capture.color is not None:
-                # Get BGR image (1920x1080x3)
-                bgr = capture.color[:, :, :3]
-                color_image = np.array(bgr, dtype=np.uint8)
-                return color_image
-        except Exception as e:
-            self.get_logger().error(f"Failed to capture image: {e}")
-        return None
-
-    # TODO: change joints order from [shoulder_lift, elbow, wrist_1, wrist_2, wrist_3, shoulder_pen]
-    # to [shoulder_pen, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]
-    def jointstate_callback(self, msg):
-        with self.lock:
-            if not self.is_recording:
-                return
-
-            # Rate limiting: skip if not enough time has passed since last frame
-            current_time = time.time()
-            if current_time - self.last_record_time < self.frame_interval:
-                return
-
-            # Get current position with gripper (0 for closed)
-            current_position = np.array(list(msg.position) + [0], dtype=np.float32)
-
-            # Only record if we have a previous position (for action)
-            if self.previous_position is not None:
-                # Capture image from Azure Kinect camera
-                image = self.capture_azure_image()
-
-                if image is None:
-                    self.get_logger().warn("Failed to capture image, skipping frame")
-                    return
-
-                frame = {
-                    "observation.state": self.previous_position,
-                    "observation.images.cam1": image,
-                    "action": current_position,  # Current position is the action
-                }
-
-                self.dataset.add_frame(frame, task="reach target")
-                self.frame_count += 1
-                self.last_record_time = current_time
-
-            # Update previous position for next frame
-            self.previous_position = current_position
+    def get_latest(self):
+        with self._lock:
+            return self._latest.copy() if self._latest is not None else None
 
 
 def main():
-    # Robot configuration
-    n_joints = 7
-    # joints_name = ["shoulder_pan", "shoulder_lift", "elbow", "wrist_1", "wrist_2", "wrist_3", "gripper"]
-    joints_name = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"]
+    # --- Configuration ---
+    joints_name = [
+        "shoulder_lift_joint", "elbow_joint", "wrist_1_joint",
+        "wrist_2_joint", "wrist_3_joint", "shoulder_pan_joint", "gripper_joint",
+    ]
     n_joints = len(joints_name)
-
-    # Camera configuration (Azure Kinect 1080p)
-    width = 1920
-    height = 1080
-    channel = 3
-    cam_dtype = "video"
+    width, height = 1280, 720
+    fps = 30
     root_dir = "./dataset"
-    # TODO: Change this to actual task disscription
-    task = "test"
+    task_description = "reach target"
+    use_videos = True
 
-    features = {
-        "observation.state": {
-            "dtype": "float32",
-            "shape": (n_joints,),
-            "names": list(joints_name),
-        },
-        "observation.images.cam1": {
-            "dtype": cam_dtype,
-            "shape": (height, width, channel),
-            "names": ["height", "width", "channel"],
-        },
-        "action": {
-            "dtype": "float32",
-            "shape": (n_joints,),
-            "names": list(joints_name),
-        },
-    }
+
+    # --- Dataset ---
+    if use_videos is True:
+        features = {
+            "observation.state": {
+                "dtype": "float32", "shape": (n_joints,), "names": list(joints_name),
+            },
+            "observation.images.cam1": {
+                "dtype": "video", "shape": (height, width, 3), "names": ["height", "width", "channel"],
+            },
+            "observation.images.cam2": {
+                "dtype": "video", "shape": (height, width, 3), "names": ["height", "width", "channel"],
+            },
+            "action": {
+                "dtype": "float32", "shape": (n_joints,), "names": list(joints_name),
+            },
+        }
+    else:
+        features = {
+            "observation.state": {
+                "dtype": "float32", "shape": (n_joints,), "names": list(joints_name),
+            },
+            "observation.images.cam1": {
+                "dtype": "image", "shape": (height, width, 3), "names": ["height", "width", "channel"],
+            },
+            "observation.images.cam2": {
+                "dtype": "image", "shape": (height, width, 3), "names": ["height", "width", "channel"],
+            },
+            "action": {
+                "dtype": "float32", "shape": (n_joints,), "names": list(joints_name),
+            },
+        }
 
     dataset = LeRobotDataset.create(
         repo_id="zhekai-w/ur5_lerobot_dataset",
-        fps=30,
+        fps=fps,
         features=features,
         root=root_dir,
         robot_type="ur5",
-        use_videos=True,
-        batch_encoding_size=1,
+        use_videos=use_videos,
+        video_backend="torchcodec",
+        image_writer_processes=10,
+        image_writer_threads=10,
     )
 
+    # --- ROS2 ---
     rclpy.init()
-    data_collector = DataCollector(dataset)
+    joint_tap = JointStateTap()
+    executor = MultiThreadedExecutor()
+    executor.add_node(joint_tap)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+
+    # --- Cameras ---
+    # Azure Kinect
+    k4a_config = Config()
+    k4a_config.color_resolution = pyk4a.ColorResolution.RES_720P
+    k4a_config.depth_mode = pyk4a.DepthMode.NFOV_UNBINNED
+    k4a_config.camera_fps = pyk4a.FPS.FPS_30
+    k4a_config.synchronized_images_only = True
+    k4a = PyK4A(k4a_config)
+    k4a.start()
+
+    # Realsense
+    rs_pipeline = rs.pipeline()
+    rs_config = rs.config()
+    rs_config.enable_stream(rs.stream.color, width, height, rs.format.rgb8, 30)
+    rs_pipeline.start(rs_config)
+
+    # Async camera capture threads
+    latest_k4a = {"img": None, "lock": threading.Lock()}
+    latest_rs = {"img": None, "lock": threading.Lock()}
+    camera_running = threading.Event()
+    camera_running.set()
+
+    def k4a_capture_loop():
+        while camera_running.is_set():
+            try:
+                capture = k4a.get_capture()
+                if capture.color is not None:
+                    with latest_k4a["lock"]:
+                        latest_k4a["img"] = capture.color[:, :, 2::-1].copy()
+            except Exception:
+                time.sleep(0.01)
+
+    def rs_capture_loop():
+        while camera_running.is_set():
+            try:
+                frames = rs_pipeline.wait_for_frames()
+                color_frame = frames.get_color_frame()
+                if color_frame:
+                    with latest_rs["lock"]:
+                        latest_rs["img"] = np.asanyarray(color_frame.get_data(), dtype=np.uint8)
+            except Exception:
+                time.sleep(0.01)
+
+    threading.Thread(target=k4a_capture_loop, daemon=True).start()
+    threading.Thread(target=rs_capture_loop, daemon=True).start()
+    time.sleep(1.0)
+
+    def get_k4a_image():
+        with latest_k4a["lock"]:
+            return latest_k4a["img"].copy() if latest_k4a["img"] is not None else None
+
+    def get_rs_image():
+        with latest_rs["lock"]:
+            return latest_rs["img"].copy() if latest_rs["img"] is not None else None
+
+    # --- Interactive collection loop ---
+    episode_index = 0
+    dt = 1.0 / fps
+
+    print("\n=== Interactive Collection (LeRobot) ===")
+    print("ENTER: start recording one episode")
+    print("During recording: ENTER=SAVE, 'q'+ENTER=DISCARD\n")
 
     try:
-        rclpy.spin(data_collector)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        # Stop Azure Kinect camera
-        try:
-            data_collector.k4a.stop()
-            data_collector.get_logger().info("Azure Kinect camera stopped")
-        except Exception as e:
-            print(f"Error stopping camera: {e}")
+        while rclpy.ok():
+            user_in = input("[READY] Press ENTER to start (or 'q'+ENTER to quit): ").strip().lower()
+            if user_in == 'q':
+                break
 
-        data_collector.destroy_node()
-        rclpy.shutdown()
+            # ---- Record until ENTER (save) or 'q' (discard) ----
+            print(f"[INFO] Recording episode {episode_index}. ENTER=SAVE, 'q'+ENTER=DISCARD.")
+            stop_event = threading.Event()
+            quit_event = threading.Event()
+
+            def key_reader():
+                try:
+                    line = sys.stdin.readline()
+                except Exception:
+                    line = ""
+                line = (line or "").strip().lower()
+                if line == 'q':
+                    quit_event.set()
+                else:
+                    stop_event.set()
+
+            t_key = threading.Thread(target=key_reader, daemon=True)
+            t_key.start()
+
+            frame_count = 0
+            previous_position = None
+
+            while not stop_event.is_set() and not quit_event.is_set():
+                t_now = time.time()
+
+                current_position = joint_tap.get_latest()
+                if current_position is None:
+                    time.sleep(0.001)
+                    continue
+
+                if previous_position is not None:
+                    k4a_img = get_k4a_image()
+                    rs_img = get_rs_image()
+                    if k4a_img is None or rs_img is None:
+                        time.sleep(0.001)
+                        continue
+
+                    frame_data = {
+                        "observation.state": previous_position,
+                        "observation.images.cam1": k4a_img,
+                        "observation.images.cam2": rs_img,
+                        "action": current_position,
+                    }
+                    dataset.add_frame(frame_data, task=task_description)
+                    frame_count += 1
+
+                previous_position = current_position
+
+                # Pacing to target FPS
+                t_next = t_now + dt
+                while time.time() < t_next and not stop_event.is_set() and not quit_event.is_set():
+                    time.sleep(0.001)
+
+            # Decide save vs discard
+            if quit_event.is_set():
+                dataset.clear_episode_buffer()
+                print("[INFO] Episode discarded (no data written).")
+            else:
+                if frame_count > 0:
+                    print(f"[INFO] Saving episode {episode_index} with {frame_count} frames...")
+                    dataset.save_episode()
+                    episode_index += 1
+                    print(f"[INFO] Episode saved. Total episodes: {dataset.num_episodes}")
+                else:
+                    print("[INFO] No frames recorded.")
+
+            try:
+                t_key.join(timeout=0.1)
+            except Exception:
+                pass
+
+    except KeyboardInterrupt:
+        print("\n[INFO] KeyboardInterrupt")
+    finally:
+        camera_running.clear()
+        try:
+            k4a.stop()
+        except Exception:
+            pass
+        try:
+            rs_pipeline.stop()
+        except Exception:
+            pass
+
+        dataset.stop_image_writer()
+        if dataset.episodes_since_last_encoding > 0:
+            print(f"Encoding {dataset.episodes_since_last_encoding} remaining episode(s) to video...")
+            start_ep = dataset.num_episodes - dataset.episodes_since_last_encoding
+            dataset.batch_encode_videos(start_ep, dataset.num_episodes)
+            print("Video encoding complete.")
+
+        try:
+            executor.shutdown()
+        except Exception:
+            pass
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+        print("[DONE] Collector finished.")
 
 
 if __name__ == '__main__':

@@ -28,6 +28,7 @@ setup(
             'data_collect = ur5_lerobot_data_collection.data_collect:main',
             'azure_cam_pub = ur5_lerobot_data_collection.azure_cam_pub:main',
             'camera_sub = ur5_lerobot_data_collection.camera_sub:main',
+            'realsense_pub = ur5_lerobot_data_collection.realsense_pub:main'
         ],
     },
 )
