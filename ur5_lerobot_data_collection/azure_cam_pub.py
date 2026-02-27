@@ -86,7 +86,7 @@ def get_azure_intrinsics():
         't2': f"{dist_coeffs[3]:.6f}",
         'k3': f"{dist_coeffs[4]:.6f}"
     }
-    output_file = "./src/shelf/shelf_pose_est/shelf_pose_est/config/azure_camera_calibration.ini"
+    output_file = "./src/ur5_lerobot_data_collection/ur5_lerobot_data_collection/config/azure_camera_calibration.ini"
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, 'w') as f:
         config.write(f)
@@ -97,7 +97,7 @@ class ImagePublisher(Node):
     def __init__(self):
         super().__init__('image_publisher')  # Node name
         get_azure_intrinsics()
-        self.camera_matrix, self.dist_coeffs = read_camera_config("./src/shelf/shelf_pose_est/shelf_pose_est/config/azure_camera_calibration.ini")
+        self.camera_matrix, self.dist_coeffs = read_camera_config("./src/ur5_lerobot_data_collection/ur5_lerobot_data_collection/config/azure_camera_calibration.ini")
 
         # Create the publisher
         self.color_publisher = self.create_publisher(Image, '/camera/color/azure_image', 1)
