@@ -4,6 +4,7 @@ import sys
 import time
 import threading
 
+import cv2
 import numpy as np
 
 import rclpy
@@ -47,7 +48,8 @@ def main():
         "wrist_2_joint", "wrist_3_joint", "shoulder_pan_joint", "gripper_joint",
     ]
     n_joints = len(joints_name)
-    width, height = 1280, 720
+    # width, height = 1280, 720
+    width, height = 640, 360
     fps = 30
     root_dir = "./dataset"
     task_description = "reach target"
@@ -133,8 +135,10 @@ def main():
             try:
                 capture = k4a.get_capture()
                 if capture.color is not None:
+                    rgb = capture.color[:, :, 2::-1]
+                    resized = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_AREA)
                     with latest_k4a["lock"]:
-                        latest_k4a["img"] = capture.color[:, :, 2::-1].copy()
+                        latest_k4a["img"] = resized
             except Exception:
                 time.sleep(0.01)
 

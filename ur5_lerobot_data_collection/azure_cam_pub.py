@@ -143,13 +143,13 @@ class ImagePublisher(Node):
                 self.color_publisher.publish(color_msg)
 
             # Publish depth image
-            # if capture.transformed_depth is not None:
-            #     depth_image = capture.transformed_depth
-            #     # encoding="passthrough" same data type
-            #     depth_msg = self.bridge.cv2_to_imgmsg(depth_image, encoding="16UC1")
-            #     depth_msg.header.stamp = self.get_clock().now().to_msg()
-            #     depth_msg.header.frame_id = "azure_depth_frame"
-            #     self.depth_publisher.publish(depth_msg)
+            if capture.transformed_depth is not None:
+                depth_image = capture.transformed_depth
+                # encoding="passthrough" same data type
+                depth_msg = self.bridge.cv2_to_imgmsg(depth_image, encoding="16UC1")
+                depth_msg.header.stamp = self.get_clock().now().to_msg()
+                depth_msg.header.frame_id = "azure_depth_frame"
+                self.depth_publisher.publish(depth_msg)
 
         except Exception as e:
             self.get_logger().error(f"Timer callback error:{str(e)}")
