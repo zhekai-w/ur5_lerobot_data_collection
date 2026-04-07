@@ -57,7 +57,7 @@ class DataCollector(Node):
         self.dataset_lock = threading.Lock()
 
         # Recording fps
-        self.target_fps = 30
+        self.target_fps = 20
 
         # Buffer for latest joint state
         self.latest_joint_position = None
@@ -81,7 +81,7 @@ class DataCollector(Node):
             self.gripper_callback,
             1)
 
-        # Timer for recording at exactly 30fps
+        # Timer for recording at exactly 20fps
         timer_period = 1.0 / self.target_fps
         self.recording_timer = self.create_timer(timer_period, self.recording_callback)
 
@@ -334,7 +334,7 @@ class DataCollector(Node):
             # print(f"GRIPPER POSITION: {self.latest_gripper_position}")
 
     def recording_callback(self):
-        """Timer callback at exactly 30fps for recording frames"""
+        """Timer callback at exactly 20fps for recording frames"""
         with self.lock:
             if not self.is_recording:
                 return
@@ -413,7 +413,7 @@ def main():
     rgb_channel = 3
     # 3channel depth because lerobot does not support native uint16 1 channel depth
     depth_channel = 3
-    root_dir = "./dataset"
+    root_dir = "./All_Datasets/dataset_large_to_green"
     # TODO: Change this to actual task disscription
     use_videos = True
     if use_videos is True:
@@ -463,7 +463,7 @@ def main():
             repo_id=repo_id,
             root=root_dir,
             video_backend="torchcodec",
-            batch_encoding_size=30,
+            batch_encoding_size=64,
         )
         dataset.start_image_writer(num_processes=20, num_threads=20)
         dataset.episode_buffer = dataset.create_episode_buffer()
@@ -480,7 +480,7 @@ def main():
             video_backend="torchcodec",
             image_writer_processes=20,
             image_writer_threads=20,
-            # batch_encoding_size=29,
+            batch_encoding_size=64,
         )
 
     rclpy.init()
