@@ -24,7 +24,7 @@ from dualsense_controller import DualSenseController
 
 width_glob = 640
 height_glob = 360
-
+fps_glob = 30
 
 def convert_depth_channel(
     depth_frame: np.ndarray,
@@ -42,7 +42,6 @@ def convert_depth_channel(
 
 
 class DataCollector(Node):
-
     def __init__(self, dataset):
         super().__init__('joint_state_subscriber')
 
@@ -56,8 +55,10 @@ class DataCollector(Node):
         self.lock = threading.Lock()
         self.dataset_lock = threading.Lock()
 
+        self.should_quit = False
+
         # Recording fps
-        self.target_fps = 20
+        self.target_fps = fps_glob
 
         # Buffer for latest joint state
         self.latest_joint_position = None
@@ -68,7 +69,7 @@ class DataCollector(Node):
             JointState,
             "/joint_states",
             self.jointstate_callback,
-            1)
+            10)
         
         # Buffer for latest gripper state
         self.latest_gripper_position = 0.0
@@ -79,7 +80,7 @@ class DataCollector(Node):
             JointState, 
             "/gripper/joint_states",
             self.gripper_callback,
-            1)
+            10)
 
         # Timer for recording at exactly 20fps
         timer_period = 1.0 / self.target_fps
@@ -114,10 +115,14 @@ class DataCollector(Node):
         self.k4a.start()
 
         # Initialize Realsense
+        if fps_glob > 30:
+            realsense_fps = 60
+        else:
+            realsense_fps = 30
         self.pipeline = rs.pipeline()
         config = rs.config()
-        config.enable_stream(rs.stream.color, width_glob, height_glob, rs.format.rgb8, 30)
-        config.enable_stream(rs.stream.depth, width_glob, height_glob, rs.format.z16, 30)
+        config.enable_stream(rs.stream.color, width_glob, height_glob, rs.format.rgb8, realsense_fps)
+        config.enable_stream(rs.stream.depth, width_glob, height_glob, rs.format.z16, realsense_fps)
         self.pipeline.start(config)
 
 
@@ -125,6 +130,9 @@ class DataCollector(Node):
         # Azure color + depth
         self.latest_k4a_image = None
         self.latest_k4a_depth = None
+        # Save previous frame if not frame
+        self.last_k4a_image = None
+        self.last_k4a_depth = None
         self.k4a_lock = threading.Lock()   # protects both latest_k4a_image + latest_k4a_depth
         # Realsense color + depth
         self.latest_rs_image = None
@@ -142,6 +150,7 @@ class DataCollector(Node):
         self.listener = keyboard.Listener(on_press=self.on_press)
         self.listener.start()
         print("\033[36m Remember to change task description before recording.\033[0m")
+        print(f"Collecting data at {self.target_fps}hz, realsense running at {realsense_fps}")
         print("Press 's' to start recording, 'e' to end episode, " \
                 "'q' to quit, 'e' to delete episode")
         print("Press 'create' to start recording, 'cross' to end episode, " \
@@ -255,7 +264,8 @@ class DataCollector(Node):
 
     def on_btn_quit(self):
         print("\nQuitting...")
-        raise SystemExit()
+        # raise SystemExit()
+        self.should_quit = True
 
     def on_btn_discard(self):
         with self.lock:
@@ -317,7 +327,8 @@ class DataCollector(Node):
                 
             elif key.char == 'q':
                 print("\nQuitting...")
-                raise SystemExit()
+                # raise SystemExit()
+                self.should_quit = True
         except AttributeError:
             pass
 
@@ -354,12 +365,13 @@ class DataCollector(Node):
                 rs_image, rs_depth = self.get_latest_rs()
 
                 if k4a_image is None or k4a_depth is None:
-                    self.get_logger().warn("No Azure Kinect frame available yet, skipping frame")
+                    print("No Azure Kinect frame available yet, skipping frame")
+                    # self.get_logger().warn("No Azure Kinect frame available yet, skipping frame")
                     return
                 if rs_image is None or rs_depth is None:
                     self.get_logger().warn("No RealSense frame available, skipping frame")
                     return
-
+                
                 frame = {
                     "observation.state": self.previous_position,
                     "observation.images.cam1": k4a_image,
@@ -413,9 +425,9 @@ def main():
     rgb_channel = 3
     # 3channel depth because lerobot does not support native uint16 1 channel depth
     depth_channel = 3
-    root_dir = "./All_Datasets/dataset_large_to_green"
+    root_dir = './All_Datasets/30hz/just_medium'
     # TODO: Change this to actual task disscription
-    use_videos = True
+    use_videos = False
     if use_videos is True:
         cam_dtype = "video"
     else:        
@@ -472,7 +484,7 @@ def main():
         print(f"[INFO] Creating new dataset at {root_dir}...")
         dataset = LeRobotDataset.create(
             repo_id=repo_id,
-            fps=20,
+            fps=fps_glob,
             features=features,
             root=root_dir,
             robot_type="ur5",
@@ -480,14 +492,17 @@ def main():
             video_backend="torchcodec",
             image_writer_processes=20,
             image_writer_threads=20,
-            batch_encoding_size=64,
+            batch_encoding_size=1,
         )
 
     rclpy.init()
     data_collector = DataCollector(dataset)
 
     try:
-        rclpy.spin(data_collector)
+        # rclpy.spin(data_collector)
+        while rclpy.ok() and not data_collector.should_quit:
+            rclpy.spin_once(data_collector)
+            # print("AAAAAAAAAAAAa")
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
