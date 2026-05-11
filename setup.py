@@ -29,7 +29,8 @@ setup(
             'azure_cam_pub = ur5_lerobot_data_collection.azure_cam_pub:main',
             'camera_sub = ur5_lerobot_data_collection.camera_sub:main',
             'realsense_pub = ur5_lerobot_data_collection.realsense_pub:main',
-            'data_replay = ur5_lerobot_data_collection.data_replay:main'
+            'data_replay = ur5_lerobot_data_collection.data_replay:main',
+            'all_cam_pub = ur5_lerobot_data_collection.all_cam_pub:main'
         ],
     },
 )

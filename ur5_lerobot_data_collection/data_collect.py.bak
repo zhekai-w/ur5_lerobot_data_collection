@@ -8,7 +8,6 @@ import threading
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState, Joy
-from std_msgs.msg import Float32, Float64MultiArray
 
 # LeRobot Library
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -27,15 +26,13 @@ width_glob = 640
 height_glob = 360
 fps_glob = 30
 
-WFOV_DEVICE = 6
-
-
 def convert_depth_channel(
     depth_frame: np.ndarray,
     depth_scale: float = 0.001,
     depth_min_m: float = 0.01,
     depth_max_m: float = 5.0,
 ) -> np.ndarray:
+    """Convert uint16 raw depth to 3-channel uint8 for LeRobot storage."""
     depth_m = depth_frame.astype(np.float32) * depth_scale
     depth_m[depth_frame == 0] = depth_max_m
     depth_m = np.clip(depth_m, depth_min_m, depth_max_m)
@@ -53,52 +50,39 @@ class DataCollector(Node):
         self.dataset = dataset
         self.is_recording = False
         self.frame_count = 0
+        self.previous_position = None
         self.task = self.get_parameter('task').value
         self.lock = threading.Lock()
         self.dataset_lock = threading.Lock()
 
         self.should_quit = False
 
+        # Recording fps
         self.target_fps = fps_glob
 
-        # Joint state feedback (observation.state)
+        # Buffer for latest joint state
         self.latest_joint_position = None
         self.joint_lock = threading.Lock()
 
+        # Subscribe to joint states (just for buffering)
         self.subscription = self.create_subscription(
             JointState,
             "/joint_states",
             self.jointstate_callback,
             10)
-
+        
+        # Buffer for latest gripper state
         self.latest_gripper_position = 0.0
         self.gripper_lock = threading.Lock()
 
+        # Subscriber to gripper joint states
         self.gripper_subscription = self.create_subscription(
-            JointState,
+            JointState, 
             "/gripper/joint_states",
             self.gripper_callback,
             10)
 
-        self.latest_gripper_cmd = 0.0
-        self.gripper_cmd_lock = threading.Lock()
-
-        self.gripper_cmd_subscription = self.create_subscription(
-            Float32,
-            "/gripper/commands",
-            self.gripper_cmd_callback,
-            10)
-
-        # Arm command tap (action) — actual commands sent to controller
-        self.latest_arm_cmd = None
-        self.arm_cmd_lock = threading.Lock()
-
-        self.arm_cmd_subscription = self.create_subscription(
-            Float64MultiArray,
-            "/forward_position_controller/commands",
-            self.arm_cmd_callback,
-            10)
-
+        # Timer for recording at exactly 20fps
         timer_period = 1.0 / self.target_fps
         self.recording_timer = self.create_timer(timer_period, self.recording_callback)
 
@@ -120,149 +104,123 @@ class DataCollector(Node):
             print(f"\033[93mFailed to initialize DualSense controller: {e}\033[0m")
             print("Fall back to keyboard.")
 
-        # Azure Kinect
+        # Initialize Azure Kinect
         config = Config()
         config.color_resolution = pyk4a.ColorResolution.RES_1080P
-        config.depth_mode = pyk4a.DepthMode.OFF
+        config.depth_mode = pyk4a.DepthMode.NFOV_UNBINNED
         config.camera_fps = pyk4a.FPS.FPS_30
-        config.synchronized_images_only = False
+        config.synchronized_images_only = True
+
         self.k4a = PyK4A(config)
         self.k4a.start()
 
-        # RealSense
-        realsense_fps = 60 if fps_glob > 30 else 30
+        # Initialize Realsense
+        if fps_glob > 30:
+            realsense_fps = 60
+        else:
+            realsense_fps = 30
         self.pipeline = rs.pipeline()
-        rs_config = rs.config()
-        rs_config.enable_stream(rs.stream.color, width_glob, height_glob, rs.format.rgb8, realsense_fps)
-        self.pipeline.start(rs_config)
+        config = rs.config()
+        config.enable_stream(rs.stream.color, width_glob, height_glob, rs.format.rgb8, realsense_fps)
+        config.enable_stream(rs.stream.depth, width_glob, height_glob, rs.format.z16, realsense_fps)
+        self.pipeline.start(config)
 
-        # WFOV USB camera
-        self.wfov_cap = cv2.VideoCapture(WFOV_DEVICE)
-        self.wfov_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        self.wfov_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 9999)
-        self.wfov_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 9999)
-        if not self.wfov_cap.isOpened():
-            raise RuntimeError(f"Failed to open WFOV camera at /dev/video{WFOV_DEVICE}")
 
-        # Camera buffers — depth already converted to 8-bit RGB in capture threads
+        # Async camera capture variables
+        # Azure color + depth
         self.latest_k4a_image = None
-        self.k4a_lock = threading.Lock()
-
+        self.latest_k4a_depth = None
+        # Save previous frame if not frame
+        self.last_k4a_image = None
+        self.last_k4a_depth = None
+        self.k4a_lock = threading.Lock()   # protects both latest_k4a_image + latest_k4a_depth
+        # Realsense color + depth
         self.latest_rs_image = None
-        self.rs_lock = threading.Lock()
-
-        self.latest_wfov_image = None
-        self.wfov_lock = threading.Lock()
+        self.latest_rs_depth = None
+        self.rs_lock = threading.Lock()    # protects both latest_rs_image + latest_rs_depth
 
         self.camera_running = True
 
-        self.k4a_thread = threading.Thread(target=self._k4a_capture_loop, daemon=True)
         self.rs_thread = threading.Thread(target=self._rs_capture_loop, daemon=True)
-        self.wfov_thread = threading.Thread(target=self._wfov_capture_loop, daemon=True)
-        self.k4a_thread.start()
+        self.k4a_thread = threading.Thread(target=self._k4a_capture_loop, daemon=True)
         self.rs_thread.start()
-        self.wfov_thread.start()
+        self.k4a_thread.start()
 
+        # Start keyboard listener
         self.listener = keyboard.Listener(on_press=self.on_press)
         self.listener.start()
         print("\033[36m Remember to change task description before recording.\033[0m")
         print(f"Collecting data at {self.target_fps}hz, realsense running at {realsense_fps}")
-        print("Press 's' to start recording, 'e' to end episode, 'q' to quit, 'd' to discard")
-        print("Press 'create' to start recording, 'cross' to end episode, "
-              "'triangle' to quit, 'circle' to discard episode")
-
-    # ------------------------------------------------------------------
-    # Capture loops — depth converted here, off the 30Hz timer hot path
-    # ------------------------------------------------------------------
+        print("Press 's' to start recording, 'e' to end episode, " \
+                "'q' to quit, 'e' to delete episode")
+        print("Press 'create' to start recording, 'cross' to end episode, " \
+                "'triangle' to quit, 'circle' to delete episode")
 
     def _k4a_capture_loop(self):
+        """Continuously capture images from Azure Kinect in a separate thread"""
         while self.camera_running:
             try:
                 capture = self.k4a.get_capture()
                 if capture is None:
                     continue
-                if capture.color is None:
+                if capture.color is None or capture.transformed_depth is None:
                     continue
 
+                # Process outside the lock
                 rgb = capture.color[:, :, 2::-1]
                 rgb = cv2.resize(rgb, (width_glob, height_glob), interpolation=cv2.INTER_AREA)
                 color_image = np.array(rgb, dtype=np.uint8)
 
+                depth = capture.transformed_depth
+                depth = cv2.resize(depth, (width_glob, height_glob), interpolation=cv2.INTER_NEAREST)
+
+                # Only write under the lock
                 with self.k4a_lock:
                     self.latest_k4a_image = color_image
+                    self.latest_k4a_depth = depth
 
             except Exception as e:
                 self.get_logger().error(f"Azure Kinect capture error: {e}")
                 time.sleep(0.01)
 
     def _rs_capture_loop(self):
+        """Continuously capture images from RealSense in a separate thread"""
         while self.camera_running:
             try:
                 frames = self.pipeline.wait_for_frames()
                 color_frame = frames.get_color_frame()
-                if not color_frame:
+                depth_frame = frames.get_depth_frame()
+                if not color_frame or not depth_frame:
                     continue
 
-                color_image = np.array(color_frame.get_data(), dtype=np.uint8)
+                # Process outside the lock
+                color_image = np.asanyarray(color_frame.get_data(), dtype=np.uint8)
+                depth_image = np.asanyarray(depth_frame.get_data(), dtype=np.uint16)
 
+                # Only write under the lock
                 with self.rs_lock:
                     self.latest_rs_image = color_image
-
+                    self.latest_rs_depth = depth_image
             except RuntimeError as e:
                 self.get_logger().error(f"Realsense capture error: {e}")
                 time.sleep(0.01)
 
-    def _wfov_capture_loop(self):
-        while self.camera_running:
-            try:
-                ret, frame = self.wfov_cap.read()
-                if not ret:
-                    time.sleep(0.01)
-                    continue
-
-                h, w = frame.shape[:2]
-                target_ratio = width_glob / height_glob
-                if w / h > target_ratio:
-                    crop_w = int(h * target_ratio)
-                    x = (w - crop_w) // 2
-                    frame = frame[:, x:x + crop_w]
-                else:
-                    crop_h = int(w / target_ratio)
-                    y = (h - crop_h) // 2
-                    frame = frame[y:y + crop_h, :]
-                frame = cv2.resize(frame, (width_glob, height_glob), interpolation=cv2.INTER_AREA)
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-                with self.wfov_lock:
-                    self.latest_wfov_image = frame
-
-            except Exception as e:
-                self.get_logger().error(f"WFOV capture error: {e}")
-                time.sleep(0.01)
-
-    # ------------------------------------------------------------------
-    # Buffer getters
-    # ------------------------------------------------------------------
-
     def get_latest_k4a(self):
+        """Get the most recent synchronized k4a color + depth (same capture)"""
         with self.k4a_lock:
-            if self.latest_k4a_image is not None:
-                return self.latest_k4a_image.copy()
-        return None
+            if self.latest_k4a_image is not None and self.latest_k4a_depth is not None:
+                return self.latest_k4a_image.copy(), self.latest_k4a_depth.copy()
+        return None, None
 
     def get_latest_rs(self):
+        """Get the most recent synchronized rs color + depth (same capture)"""
         with self.rs_lock:
-            if self.latest_rs_image is not None:
-                return self.latest_rs_image.copy()
-        return None
-
-    def get_latest_wfov(self):
-        with self.wfov_lock:
-            if self.latest_wfov_image is not None:
-                return self.latest_wfov_image.copy()
-        return None
+            if self.latest_rs_image is not None and self.latest_rs_depth is not None:
+                return self.latest_rs_image.copy(), self.latest_rs_depth.copy()
+        return None, None
 
     def get_latest_joint_position(self):
+        """Get the most recent joint position"""
         with self.joint_lock:
             if self.latest_joint_position is not None:
                 return self.latest_joint_position.copy()
@@ -272,14 +230,11 @@ class DataCollector(Node):
         with self.gripper_lock:
             return self.latest_gripper_position
 
-    # ------------------------------------------------------------------
-    # Button / keyboard handlers
-    # ------------------------------------------------------------------
-
     def on_btn_start_record(self):
         with self.lock:
             self.is_recording = True
             self.frame_count = 0
+            self.previous_position = None
             print("\nStarted recording")
 
     def on_btn_save_episode(self):
@@ -290,6 +245,7 @@ class DataCollector(Node):
                 self.is_recording = False
                 should_save = True
                 frame_count_to_report = self.frame_count
+                self.previous_position = None
                 self.frame_count = 0
             else:
                 print("\nNo frames recorded yet")
@@ -301,25 +257,27 @@ class DataCollector(Node):
                 print(f"Episode saved ({frame_count_to_report} frames)")
                 print(f"Total episodes: {self.dataset.num_episodes}")
                 print(f"Task description: {self.task}")
-                print("Press 'create' to start recording, 'cross' to end episode, "
-                      "'triangle' to quit, 'circle' to discard episode")
+                print("Press 'create' to start recording, 'cross' to end episode, " \
+                    "'triangle' to quit, 'circle' to delete episode")
             except Exception as e:
                 print(f"\nError saving episode: {e}")
 
     def on_btn_quit(self):
         print("\nQuitting...")
+        # raise SystemExit()
         self.should_quit = True
 
     def on_btn_discard(self):
         with self.lock:
             self.is_recording = False
             self.frame_count = 0
-        time.sleep(0.1)
+            self.previous_position = None
+        time.sleep(0.1) # let camera writes finish
         with self.dataset_lock:
             self.dataset.clear_episode_buffer()
         print("\nEpisode discarded")
-        print("Press 'create' to start recording, 'cross' to end episode, "
-              "'triangle' to quit, 'circle' to discard episode")
+        print("Press 'create' to start recording, 'cross' to end episode, " \
+            "'triangle' to quit, 'circle' to delete episode")
 
     def on_press(self, key):
         try:
@@ -327,8 +285,10 @@ class DataCollector(Node):
                 with self.lock:
                     self.is_recording = True
                     self.frame_count = 0
+                    self.previous_position = None
                     print("\nStarted recording")
             elif key.char == 'e':
+                # Check and update state inside lock, but save outside to avoid blocking
                 should_save = False
                 frame_count_to_report = 0
                 with self.lock:
@@ -336,9 +296,12 @@ class DataCollector(Node):
                         self.is_recording = False
                         should_save = True
                         frame_count_to_report = self.frame_count
+                        self.previous_position = None
                         self.frame_count = 0
                     else:
                         print("\nNo frames recorded yet")
+
+                # Save episode outside the lock to avoid blocking callbacks
                 if should_save:
                     try:
                         print("\nSaving episode...")
@@ -346,122 +309,89 @@ class DataCollector(Node):
                             self.dataset.save_episode()
                         print(f"Episode saved ({frame_count_to_report} frames)")
                         print(f"Total episodes: {self.dataset.num_episodes}")
-                        print("Press 's' to start recording, 'e' to end episode, "
-                              "'q' to quit, 'd' to discard")
+                        print("Press 's' to start recording, 'e' to end episode, " \
+                                "'q' to quit, 'e' to delete episode")
+
                     except Exception as e:
                         print(f"\nError saving episode: {e}")
             elif key.char == 'd':
                 with self.lock:
                     self.is_recording = False
                     self.frame_count = 0
+                    self.previous_position = None
                 with self.dataset_lock:
                     self.dataset.clear_episode_buffer()
                 print("\nEpisode not saved")
-                print("Press 's' to start recording, 'e' to end episode, "
-                      "'q' to quit, 'd' to discard")
+                print("Press 's' to start recording, 'e' to end episode, " \
+                        "'q' to quit, 'e' to delete episode")
+                
             elif key.char == 'q':
                 print("\nQuitting...")
+                # raise SystemExit()
                 self.should_quit = True
         except AttributeError:
             pass
 
-    # ------------------------------------------------------------------
-    # Joint state callbacks
-    # ------------------------------------------------------------------
-
-    JOINT_ORDER = [
-        "shoulder_pan_joint",
-        "shoulder_lift_joint",
-        "elbow_joint",
-        "wrist_1_joint",
-        "wrist_2_joint",
-        "wrist_3_joint",
-    ]
-
     def jointstate_callback(self, msg):
-        name_to_pos = dict(zip(msg.name, msg.position))
-        current_position = np.array(
-            [name_to_pos[j] for j in self.JOINT_ORDER], dtype=np.float32
-        )
+        """Just buffer the latest joint state - no recording logic here"""
+        # Get current position with gripper (0 for closed)
+        current_position = np.array(list(msg.position), dtype=np.float32)
         with self.joint_lock:
             self.latest_joint_position = current_position
-
+    
     def gripper_callback(self, msg):
         with self.gripper_lock:
             self.latest_gripper_position = msg.position[0]
-
-    def gripper_cmd_callback(self, msg: Float32):
-        with self.gripper_cmd_lock:
-            self.latest_gripper_cmd = msg.data
-
-    def arm_cmd_callback(self, msg: Float64MultiArray):
-        arr = np.array(list(msg.data), dtype=np.float32)
-        with self.arm_cmd_lock:
-            self.latest_arm_cmd = arr
-
-    def get_latest_arm_cmd(self):
-        with self.arm_cmd_lock:
-            if self.latest_arm_cmd is not None:
-                return self.latest_arm_cmd.copy()
-        return None
-
-    # ------------------------------------------------------------------
-    # Recording timer
-    # ------------------------------------------------------------------
+            # print(f"GRIPPER POSITION: {self.latest_gripper_position}")
 
     def recording_callback(self):
+        """Timer callback at exactly 20fps for recording frames"""
         with self.lock:
             if not self.is_recording:
                 return
 
+            # Get latest joint position
             arm_position = self.get_latest_joint_position()
             gripper_position = self.get_latest_gripper_position()
-            if arm_position is None:
+            current_position = np.append(arm_position, gripper_position).astype(np.float32)
+            if current_position is None:
                 self.get_logger().warn("No joint state available yet, skipping frame")
                 return
-            obs_state = np.append(arm_position, gripper_position).astype(np.float32)
 
-            arm_cmd = self.get_latest_arm_cmd()
-            if arm_cmd is None:
-                self.get_logger().warn("No arm command available yet, skipping frame")
-                return
-            with self.gripper_cmd_lock:
-                gripper_cmd = self.latest_gripper_cmd
-            action = np.append(arm_cmd[:len(arm_position)], gripper_cmd).astype(np.float32)
+            # Only record if we have a previous position (for action)
+            if self.previous_position is not None:
+                # Get the latest cached image from async capture thread
+                k4a_image, k4a_depth = self.get_latest_k4a()
+                rs_image, rs_depth = self.get_latest_rs()
 
-            k4a_image = self.get_latest_k4a()
-            rs_image = self.get_latest_rs()
-            wfov_image = self.get_latest_wfov()
+                if k4a_image is None or k4a_depth is None:
+                    print("No Azure Kinect frame available yet, skipping frame")
+                    # self.get_logger().warn("No Azure Kinect frame available yet, skipping frame")
+                    return
+                if rs_image is None or rs_depth is None:
+                    self.get_logger().warn("No RealSense frame available, skipping frame")
+                    return
+                
+                frame = {
+                    "observation.state": self.previous_position,
+                    "observation.images.cam1": k4a_image,
+                    "observation.images.cam2": rs_image,
+                    "observation.images.cam1_depth": convert_depth_channel(k4a_depth),
+                    "observation.images.cam2_depth": convert_depth_channel(rs_depth),
+                    "action": current_position,
+                }
 
-            if k4a_image is None:
-                print("No Azure Kinect frame available yet, skipping frame")
-                return
-            if rs_image is None:
-                self.get_logger().warn("No RealSense frame available, skipping frame")
-                return
-            if wfov_image is None:
-                self.get_logger().warn("No WFOV frame available, skipping frame")
-                return
+                with self.dataset_lock:
+                    self.dataset.add_frame(frame, task=self.task)
+                self.frame_count += 1
 
-            frame = {
-                "observation.state":            obs_state,
-                "observation.images.cam1":       k4a_image,
-                "observation.images.cam2":       rs_image,
-                "observation.images.cam3":       wfov_image,
-                "action":                        action,
-            }
-
-            with self.dataset_lock:
-                self.dataset.add_frame(frame, task=self.task)
-            self.frame_count += 1
-
-    # ------------------------------------------------------------------
-    # Shutdown
-    # ------------------------------------------------------------------
+            # Update previous position for next frame
+            self.previous_position = current_position
 
     def stop_camera(self):
+        """Stop the camera capture thread and Azure Kinect"""
         self.camera_running = False
-        for thread in (self.k4a_thread, self.rs_thread, self.wfov_thread):
+        for thread in (self.k4a_thread, self.rs_thread):
             if thread.is_alive():
                 thread.join(timeout=1.0)
         try:
@@ -475,11 +405,6 @@ class DataCollector(Node):
         except Exception as e:
             print(f"Error stopping Realsense: {e}")
         try:
-            self.wfov_cap.release()
-            self.get_logger().info("WFOV camera released")
-        except Exception as e:
-            print(f"Error releasing WFOV camera: {e}")
-        try:
             if self.controller is not None:
                 self.controller.deactivate()
                 self.get_logger().info("Dualsense controller deactivated")
@@ -488,16 +413,25 @@ class DataCollector(Node):
 
 
 def main():
-    joints_name = ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint", "wrist_1_joint",
-                   "wrist_2_joint", "wrist_3_joint", "gripper_joint"]
+    # Robot configuration
+    joints_name = ["shoulder_lift_joint", "elbow_joint", "wrist_1_joint", "wrist_2_joint",
+        "wrist_3_joint", "shoulder_pan_joint", "gripper_joint"]
+    # joints_name = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"]
     n_joints = len(joints_name)
 
+    # Camera configuration (Azure Kinect 1080p)
     width = width_glob
     height = height_glob
     rgb_channel = 3
-    root_dir = './all_datasets/1_std_datasets/apple_to_whiteplate'
+    # 3channel depth because lerobot does not support native uint16 1 channel depth
+    depth_channel = 3
+    root_dir = './All_Datasets/30hz/test_attention'
+    # TODO: Change this to actual task disscription
     use_videos = False
-    cam_dtype = "video" if use_videos else "image"
+    if use_videos is True:
+        cam_dtype = "video"
+    else:        
+        cam_dtype = "image"
 
     features = {
         "observation.state": {
@@ -515,9 +449,14 @@ def main():
             "shape": (height, width, rgb_channel),
             "names": ["height", "width", "channel"],
         },
-        "observation.images.cam3": {
+        "observation.images.cam1_depth": {
             "dtype": cam_dtype,
-            "shape": (height, width, rgb_channel),
+            "shape": (height, width, depth_channel),
+            "names": ["height", "width", "channel"],
+        },
+        "observation.images.cam2_depth": {
+            "dtype": cam_dtype,
+            "shape": (height, width, depth_channel),
             "names": ["height", "width", "channel"],
         },
         "action": {
@@ -538,10 +477,9 @@ def main():
             video_backend="torchcodec",
             batch_encoding_size=64,
         )
-        dataset.start_image_writer(num_processes=4, num_threads=4)
+        dataset.start_image_writer(num_processes=20, num_threads=20)
         dataset.episode_buffer = dataset.create_episode_buffer()
-        print(f"[INFO] Existing dataset has {dataset.num_episodes} episodes, "
-              f"{dataset.meta.total_frames} frames")
+        print(f"[INFO] Existing dataset has {dataset.num_episodes} episodes, {dataset.meta.total_frames} frames")
     else:
         print(f"[INFO] Creating new dataset at {root_dir}...")
         dataset = LeRobotDataset.create(
@@ -552,8 +490,8 @@ def main():
             robot_type="ur5",
             use_videos=use_videos,
             video_backend="torchcodec",
-            image_writer_processes=4,
-            image_writer_threads=4,
+            image_writer_processes=20,
+            image_writer_threads=20,
             batch_encoding_size=1,
         )
 
@@ -561,14 +499,18 @@ def main():
     data_collector = DataCollector(dataset)
 
     try:
+        # rclpy.spin(data_collector)
         while rclpy.ok() and not data_collector.should_quit:
             rclpy.spin_once(data_collector)
+            # print("AAAAAAAAAAAAa")
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
         data_collector.stop_camera()
+        # Stop the async image writer before shutting down
         dataset.stop_image_writer()
 
+        # Encode any remaining episodes that haven't been encoded yet
         if dataset.episodes_since_last_encoding > 0:
             print(f"Encoding {dataset.episodes_since_last_encoding} remaining episode(s) to video...")
             start_ep = dataset.num_episodes - dataset.episodes_since_last_encoding

@@ -1,6 +1,6 @@
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
@@ -100,8 +100,10 @@ class ImagePublisher(Node):
         self.camera_matrix, self.dist_coeffs = read_camera_config("./src/ur5_lerobot_data_collection/ur5_lerobot_data_collection/config/azure_camera_calibration.ini")
 
         # Create the publisher
-        self.color_publisher = self.create_publisher(Image, '/camera/color/azure_image', 1)
+        self.color_publisher = self.create_publisher(CompressedImage, '/camera/color/azure_image/compressed', 1)
         self.depth_publisher = self.create_publisher(Image, '/camera/depth/azure_depth', 1)
+        self.declare_parameter('jpeg_quality', 100)
+        self.jpeg_quality = self.get_parameter('jpeg_quality').get_parameter_value().integer_value
         timer_period = 0.033  # Publish at 30Hz
         self.timer = self.create_timer(timer_period, self.timer_callback)
 
@@ -118,9 +120,13 @@ class ImagePublisher(Node):
         # Initialize CvBridge
         self.bridge = CvBridge()
 
+        self.declare_parameter('display', True)
+        self.display = self.get_parameter('display').get_parameter_value().bool_value
+
         self.get_logger().info("Camera Node Initialized and Running")
         self.get_logger().info("Publishing to: /camera/color/azure_image and /camera/depth/azure_depth")
         self.get_logger().info("Use \"ros2 topic list\" to see all topics")
+        self.get_logger().info(f"Display: {self.display}")
 
 
     def timer_callback(self):
@@ -128,7 +134,7 @@ class ImagePublisher(Node):
             # Get the frames
             capture = self.k4a.get_capture()
 
-            # Publish color image
+            # Publish color image as JPEG-compressed
             if capture.color is not None:
                 bgr = capture.color[:, :, :3]
                 color_image = np.array(bgr, dtype=np.uint8)
@@ -136,11 +142,17 @@ class ImagePublisher(Node):
                 # Undistort image
                 # undistort = undistort_image(color_image, self.camera_matrix, self.dist_coeffs)
 
-                # Create and publish the image message
-                color_msg = self.bridge.cv2_to_imgmsg(color_image, encoding="bgr8")
-                color_msg.header.stamp = self.get_clock().now().to_msg()
-                color_msg.header.frame_id = "azure_color_frame"
-                self.color_publisher.publish(color_msg)
+                ok, encoded = cv2.imencode(
+                    '.jpg', color_image,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality],
+                )
+                if ok:
+                    color_msg = CompressedImage()
+                    color_msg.header.stamp = self.get_clock().now().to_msg()
+                    color_msg.header.frame_id = "azure_color_frame"
+                    color_msg.format = "jpeg"
+                    color_msg.data = encoded.tobytes()
+                    self.color_publisher.publish(color_msg)
 
             # Publish depth image
             if capture.transformed_depth is not None:
@@ -150,6 +162,14 @@ class ImagePublisher(Node):
                 depth_msg.header.stamp = self.get_clock().now().to_msg()
                 depth_msg.header.frame_id = "azure_depth_frame"
                 self.depth_publisher.publish(depth_msg)
+
+            if self.display and capture.color is not None and capture.transformed_depth is not None:
+                display_w, display_h = 640, 360
+                color_small = cv2.resize(color_image, (display_w, display_h))
+                depth_display = cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                depth_small = cv2.resize(cv2.cvtColor(depth_display, cv2.COLOR_GRAY2BGR), (display_w, display_h))
+                cv2.imshow("Azure Camera", np.hstack([color_small, depth_small]))
+                cv2.waitKey(1)
 
         except Exception as e:
             self.get_logger().error(f"Timer callback error:{str(e)}")
@@ -164,6 +184,7 @@ def main(args=None):
     # Stop the Azure Kinect DK pipeline after spinning
     image_publisher.k4a.stop()
     image_publisher.destroy_node()  # Clean up before exiting
+    cv2.destroyAllWindows()
     rclpy.shutdown()
 
 if __name__ == '__main__':
