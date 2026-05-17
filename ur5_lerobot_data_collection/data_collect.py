@@ -495,7 +495,7 @@ def main():
     width = width_glob
     height = height_glob
     rgb_channel = 3
-    root_dir = './all_datasets/1_std_datasets/apple_to_whiteplate'
+    root_dir = './all_datasets/1_std_datasets/test_fruit'
     use_videos = False
     cam_dtype = "video" if use_videos else "image"
 
