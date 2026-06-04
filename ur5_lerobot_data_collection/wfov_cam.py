@@ -1,9 +1,12 @@
 import cv2
+import queue
 import subprocess
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
-DEVICE = "/dev/video6"
+DEVICE = "/dev/video0"
 WIN = "Camera Feed  |  Controls"
 SAVE_DIR = Path.home() / "work/videos"
 
@@ -27,9 +30,16 @@ CONTROLS = [
 
 current_values = {}   # what we last wrote (drives trackbars)
 hw_values = {}        # what the camera reports back (for display)
-writer = None
 recording = False
 record_path = ""
+
+_write_queue = queue.Queue(maxsize=32)
+_write_thread = None
+
+# latest-frame capture
+_latest_frame = None
+_latest_lock = threading.Lock()
+_capture_running = True
 
 _ALL_CTRL_NAMES = ",".join(name for _, name, *_ in CONTROLS)
 
@@ -53,6 +63,11 @@ def v4l2_read_all():
             except ValueError:
                 pass
 
+def _hw_refresh_loop():
+    while True:
+        v4l2_read_all()
+        time.sleep(1.0)
+
 def make_callback(name, real_min):
     def cb(trackbar_val):
         real = trackbar_val + real_min
@@ -60,25 +75,53 @@ def make_callback(name, real_min):
         v4l2_set(name, real)
     return cb
 
+def _capture_loop(cap):
+    global _latest_frame, _capture_running
+    while _capture_running:
+        ret, frame = cap.read()
+        if ret:
+            with _latest_lock:
+                _latest_frame = frame
+
 def init_camera():
     for _, name, _, _, default, _ in CONTROLS:
         v4l2_set(name, default)
 
+def _writer_worker():
+    writer = None
+    while True:
+        item = _write_queue.get()
+        if item is None:          # sentinel: stop thread
+            if writer:
+                writer.release()
+            break
+        cmd, *args = item
+        if cmd == "open":
+            w, h, fps, path = args
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(path, fourcc, fps, (w, h))
+        elif cmd == "frame" and writer:
+            writer.write(args[0])
+        elif cmd == "close":
+            if writer:
+                writer.release()
+                writer = None
+
 def start_recording(w, h, fps=30.0):
-    global writer, recording, record_path
+    global recording, record_path, _write_thread
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     record_path = str(SAVE_DIR / f"capture_{ts}.mp4")
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(record_path, fourcc, fps, (w, h))
+    if _write_thread is None or not _write_thread.is_alive():
+        _write_thread = threading.Thread(target=_writer_worker, daemon=True)
+        _write_thread.start()
+    _write_queue.put(("open", w, h, fps, record_path))
     recording = True
     print(f"Recording → {record_path}")
 
 def stop_recording():
-    global writer, recording
-    if writer:
-        writer.release()
-        writer = None
+    global recording
+    _write_queue.put(("close",))
     recording = False
     print(f"Saved: {record_path}")
 
@@ -102,17 +145,18 @@ DISPLAY_LABELS = [
 def draw_overlay(frame):
     h, w = frame.shape[:2]
 
-    # ── left panel ────────────────────────────────────────────────────────────
+    # ── panels (one copy for both rectangles) ────────────────────────────────
     panel_w = 175
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (panel_w, h), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (0, h - 26), (w, h), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
 
+    # ── left panel text ───────────────────────────────────────────────────────
     line_h = 16
     y0 = 14
     for i, (label, key) in enumerate(DISPLAY_LABELS):
         val = hw_values.get(key, "?")
-        # Human-readable for menu controls
         if isinstance(val, int):
             if key == "auto_exposure":
                 val = "Manual" if val == 1 else "Auto"
@@ -127,9 +171,6 @@ def draw_overlay(frame):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 230, 180), 1)
 
     # ── bottom bar ────────────────────────────────────────────────────────────
-    overlay2 = frame.copy()
-    cv2.rectangle(overlay2, (0, h - 26), (w, h), (0, 0, 0), -1)
-    cv2.addWeighted(overlay2, 0.55, frame, 0.45, 0, frame)
     rec_hint = "[r] stop" if recording else "[r] record"
     cv2.putText(frame, f"{rec_hint}   [q] quit", (8, h - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
@@ -161,21 +202,23 @@ for label, name, real_min, real_max, default, _ in CONTROLS:
     current_values[name] = default
     cv2.createTrackbar(label, WIN, trackbar_default, trackbar_max, make_callback(name, real_min))
 
-# ── main loop ─────────────────────────────────────────────────────────────────
-frame_count = 0
+# ── background threads ────────────────────────────────────────────────────────
 v4l2_read_all()   # initial read before first frame
+threading.Thread(target=_hw_refresh_loop, daemon=True).start()
+threading.Thread(target=_capture_loop, args=(cap,), daemon=True).start()
 
+# ── main loop ─────────────────────────────────────────────────────────────────
 while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+    with _latest_lock:
+        frame = _latest_frame
+    if frame is None:
+        time.sleep(0.001)
+        continue
 
-    frame_count += 1
-    if frame_count % 30 == 0:   # refresh hw values ~once per second
-        v4l2_read_all()
+    frame = frame.copy()  # own copy before overlay mutates it
 
-    if recording and writer:
-        writer.write(frame)
+    if recording:
+        _write_queue.put(("frame", frame.copy()))
 
     frame = draw_overlay(frame)
     cv2.imshow(WIN, frame)
@@ -189,7 +232,10 @@ while True:
         else:
             start_recording(frame_w, frame_h)
 
+_capture_running = False
 if recording:
     stop_recording()
+# drain writer queue before exit
+_write_queue.put(None)
 cap.release()
 cv2.destroyAllWindows()

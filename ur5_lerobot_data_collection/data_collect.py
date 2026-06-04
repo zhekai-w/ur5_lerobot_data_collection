@@ -7,7 +7,7 @@ import threading
 # ROS2 Library
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import JointState, Joy
+from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32, Float64MultiArray
 
 # LeRobot Library
@@ -17,9 +17,6 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 import pyk4a
 from pyk4a import Config, PyK4A
 
-# Realsense
-import pyrealsense2 as rs
-
 # Dualsense
 from dualsense_controller import DualSenseController
 
@@ -27,7 +24,7 @@ width_glob = 640
 height_glob = 360
 fps_glob = 30
 
-WFOV_DEVICE = 6
+WFOV_DEVICE = 0
 
 
 def convert_depth_channel(
@@ -129,13 +126,6 @@ class DataCollector(Node):
         self.k4a = PyK4A(config)
         self.k4a.start()
 
-        # RealSense
-        realsense_fps = 60 if fps_glob > 30 else 30
-        self.pipeline = rs.pipeline()
-        rs_config = rs.config()
-        rs_config.enable_stream(rs.stream.color, width_glob, height_glob, rs.format.rgb8, realsense_fps)
-        self.pipeline.start(rs_config)
-
         # WFOV USB camera
         self.wfov_cap = cv2.VideoCapture(WFOV_DEVICE)
         self.wfov_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
@@ -148,25 +138,20 @@ class DataCollector(Node):
         self.latest_k4a_image = None
         self.k4a_lock = threading.Lock()
 
-        self.latest_rs_image = None
-        self.rs_lock = threading.Lock()
-
         self.latest_wfov_image = None
         self.wfov_lock = threading.Lock()
 
         self.camera_running = True
 
         self.k4a_thread = threading.Thread(target=self._k4a_capture_loop, daemon=True)
-        self.rs_thread = threading.Thread(target=self._rs_capture_loop, daemon=True)
         self.wfov_thread = threading.Thread(target=self._wfov_capture_loop, daemon=True)
         self.k4a_thread.start()
-        self.rs_thread.start()
         self.wfov_thread.start()
 
         self.listener = keyboard.Listener(on_press=self.on_press)
         self.listener.start()
         print("\033[36m Remember to change task description before recording.\033[0m")
-        print(f"Collecting data at {self.target_fps}hz, realsense running at {realsense_fps}")
+        print(f"Collecting data at {self.target_fps}hz")
         print("Press 's' to start recording, 'e' to end episode, 'q' to quit, 'd' to discard")
         print("Press 'create' to start recording, 'cross' to end episode, "
               "'triangle' to quit, 'circle' to discard episode")
@@ -193,23 +178,6 @@ class DataCollector(Node):
 
             except Exception as e:
                 self.get_logger().error(f"Azure Kinect capture error: {e}")
-                time.sleep(0.01)
-
-    def _rs_capture_loop(self):
-        while self.camera_running:
-            try:
-                frames = self.pipeline.wait_for_frames()
-                color_frame = frames.get_color_frame()
-                if not color_frame:
-                    continue
-
-                color_image = np.array(color_frame.get_data(), dtype=np.uint8)
-
-                with self.rs_lock:
-                    self.latest_rs_image = color_image
-
-            except RuntimeError as e:
-                self.get_logger().error(f"Realsense capture error: {e}")
                 time.sleep(0.01)
 
     def _wfov_capture_loop(self):
@@ -248,12 +216,6 @@ class DataCollector(Node):
         with self.k4a_lock:
             if self.latest_k4a_image is not None:
                 return self.latest_k4a_image.copy()
-        return None
-
-    def get_latest_rs(self):
-        with self.rs_lock:
-            if self.latest_rs_image is not None:
-                return self.latest_rs_image.copy()
         return None
 
     def get_latest_wfov(self):
@@ -430,14 +392,10 @@ class DataCollector(Node):
             action = np.append(arm_cmd[:len(arm_position)], gripper_cmd).astype(np.float32)
 
             k4a_image = self.get_latest_k4a()
-            rs_image = self.get_latest_rs()
             wfov_image = self.get_latest_wfov()
 
             if k4a_image is None:
                 print("No Azure Kinect frame available yet, skipping frame")
-                return
-            if rs_image is None:
-                self.get_logger().warn("No RealSense frame available, skipping frame")
                 return
             if wfov_image is None:
                 self.get_logger().warn("No WFOV frame available, skipping frame")
@@ -446,8 +404,7 @@ class DataCollector(Node):
             frame = {
                 "observation.state":            obs_state,
                 "observation.images.cam1":       k4a_image,
-                "observation.images.cam2":       rs_image,
-                "observation.images.cam3":       wfov_image,
+                "observation.images.cam2":       wfov_image,
                 "action":                        action,
             }
 
@@ -461,7 +418,7 @@ class DataCollector(Node):
 
     def stop_camera(self):
         self.camera_running = False
-        for thread in (self.k4a_thread, self.rs_thread, self.wfov_thread):
+        for thread in (self.k4a_thread, self.wfov_thread):
             if thread.is_alive():
                 thread.join(timeout=1.0)
         try:
@@ -469,11 +426,6 @@ class DataCollector(Node):
             self.get_logger().info("Azure Kinect stopped")
         except Exception as e:
             print(f"Error stopping Azure Kinect: {e}")
-        try:
-            self.pipeline.stop()
-            self.get_logger().info("Realsense pipeline stopped")
-        except Exception as e:
-            print(f"Error stopping Realsense: {e}")
         try:
             self.wfov_cap.release()
             self.get_logger().info("WFOV camera released")
@@ -495,7 +447,7 @@ def main():
     width = width_glob
     height = height_glob
     rgb_channel = 3
-    root_dir = './all_datasets/1_std_datasets/test_fruit'
+    root_dir = './all_datasets/2_std_datasets/test'
     use_videos = False
     cam_dtype = "video" if use_videos else "image"
 
@@ -511,11 +463,6 @@ def main():
             "names": ["height", "width", "channel"],
         },
         "observation.images.cam2": {
-            "dtype": cam_dtype,
-            "shape": (height, width, rgb_channel),
-            "names": ["height", "width", "channel"],
-        },
-        "observation.images.cam3": {
             "dtype": cam_dtype,
             "shape": (height, width, rgb_channel),
             "names": ["height", "width", "channel"],
@@ -562,10 +509,21 @@ def main():
 
     try:
         while rclpy.ok() and not data_collector.should_quit:
-            rclpy.spin_once(data_collector)
+            rclpy.spin_once(data_collector, timeout_sec=0.001)
+
+            # k4a_img = data_collector.get_latest_k4a()
+            # if k4a_img is not None:
+            #     cv2.imshow("Azure Kinect", cv2.cvtColor(k4a_img, cv2.COLOR_RGB2BGR))
+
+            # wfov_img = data_collector.get_latest_wfov()
+            # if wfov_img is not None:
+            #     cv2.imshow("WFOV", cv2.cvtColor(wfov_img, cv2.COLOR_RGB2BGR))
+
+            # cv2.waitKey(1)
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
+        # cv2.destroyAllWindows()
         data_collector.stop_camera()
         dataset.stop_image_writer()
 
