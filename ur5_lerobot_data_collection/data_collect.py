@@ -24,7 +24,7 @@ width_glob = 640
 height_glob = 360
 fps_glob = 30
 
-WFOV_DEVICE = 0
+WFOV_DEVICE = 2
 
 
 def convert_depth_channel(
@@ -447,7 +447,7 @@ def main():
     width = width_glob
     height = height_glob
     rgb_channel = 3
-    root_dir = './all_datasets/2_std_datasets/test'
+    root_dir = './all_datasets/test_VLM'
     use_videos = False
     cam_dtype = "video" if use_videos else "image"
 

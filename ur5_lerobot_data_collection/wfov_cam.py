@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-DEVICE = "/dev/video0"
+DEVICE = "/dev/video4"
 WIN = "Camera Feed  |  Controls"
 SAVE_DIR = Path.home() / "work/videos"
 
@@ -185,7 +185,7 @@ def draw_overlay(frame):
 # ── init ──────────────────────────────────────────────────────────────────────
 init_camera()
 
-cap = cv2.VideoCapture(DEVICE)
+cap = cv2.VideoCapture(DEVICE, cv2.CAP_V4L2)
 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
